@@ -1,0 +1,1 @@
+from .fa4_compile_wrapper import fa4_compile_wrapper
