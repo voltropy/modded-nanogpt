@@ -946,6 +946,14 @@ def norm(x: Tensor):
     return F.rms_norm(x, (x.size(-1),))
 
 
+def attention_residual_mix(x_backout: Tensor, x: Tensor, x0: Tensor, query: Tensor, source_bias: Tensor):
+    # Late attention layers can softly choose between the cached clean stream, the evolving stream, and x0.
+    sources = torch.stack((x_backout, x, x0), dim=0)
+    logits = torch.einsum('d,sbtd->sbt', query.type_as(sources), norm(sources))
+    logits = logits + source_bias[:, None, None].type_as(logits)
+    return (logits.softmax(0).to(dtype=sources.dtype)[..., None] * sources).sum(0)
+
+
 class CastedLinearT(nn.Module):
     """
     Linear layer with transposed weight storage (in_features, out_features) which
@@ -1152,6 +1160,7 @@ class GPT(nn.Module):
         super().__init__()
         self.num_layers = num_layers
         self.vocab_size = next_multiple_of_n(vocab_size, n=128)
+        self.late_attnres_start = num_layers - 3
 
         self.smear_gate = nn.Linear(12, 1, bias=False)
         nn.init.zeros_(self.smear_gate.weight)
@@ -1163,6 +1172,11 @@ class GPT(nn.Module):
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
         # spherical gaussian init by @photomz
         self.value_embeds = nn.Parameter(0.01 * torch.randn(5 * self.vocab_size, model_dim, dtype=torch.bfloat16))
+
+        # Attention Residuals-style routing for the final three attention inputs.
+        # Source order: cached layer-7 stream, evolving residual stream, token embedding stream.
+        self.late_attnres_queries = nn.Parameter(0.01 * torch.randn(num_layers - self.late_attnres_start, model_dim))
+        self.late_attnres_bias = nn.Parameter(torch.tensor([[4.0, 0.0, -1.0]] * (num_layers - self.late_attnres_start)))
 
         # parameter banks for attention and value embedding gate weights
         self.attn_gate_bank = nn.Parameter(torch.zeros(10, num_heads, 12)) # 10 layers
@@ -1272,6 +1286,8 @@ class GPT(nn.Module):
         bigram_lambdas = self.bigram_lambdas.bfloat16().unbind(0)
         ag = [w.bfloat16() for w in self.attn_gate_bank.unbind(0)]
         veg = [w.bfloat16() for w in self.ve_gate_bank.unbind(0)]
+        late_attnres_queries = self.late_attnres_queries.bfloat16().unbind(0)
+        late_attnres_bias = self.late_attnres_bias.bfloat16().unbind(0)
         attn_gates = ag[:6] + [None] + ag[6:]
         ve_gates = [None] + [veg[0], veg[1]] + [None] * (self.num_layers - 6) + [veg[2], veg[3], veg[4]]
         assert len(attn_gates) == self.num_layers
@@ -1333,7 +1349,17 @@ class GPT(nn.Module):
             if i == 6:
                 x = x + skip_gate_out * skip_connection
             else:
-                attn_in = x_backout if x_backout is not None else x
+                if x_backout is not None:
+                    late_attnres_idx = i - self.late_attnres_start
+                    attn_in = attention_residual_mix(
+                        x_backout,
+                        x,
+                        x0,
+                        late_attnres_queries[late_attnres_idx],
+                        late_attnres_bias[late_attnres_idx],
+                    )
+                else:
+                    attn_in = x
                 attn_out = attn(norm(attn_in), attn_args, qkvo_w)
                 x = resid_lambdas_attn[i] * x + post_lambdas_attn[i] * attn_out + x0_inject[i]
             x = resid_lambdas_mlp[i] * x + post_lambdas_mlp[i] * ReLUSqrdMLP(norm(x), c_fc, c_proj)
@@ -1683,6 +1709,8 @@ class TrainingManager():
             "skip_gate":      {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.05, "wd_mul": 0.0},
             "attn_gate_bank": {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
             "ve_gate_bank":   {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
+            "late_attnres_queries": {"optim": "adam", "comms": "replicated", "adam_betas": [0.9,  0.95], "lr_mul": 1.0, "wd_mul": 0.0},
+            "late_attnres_bias":    {"optim": "adam", "comms": "replicated", "adam_betas": [0.9,  0.95], "lr_mul": 1.0, "wd_mul": 0.0},
             "lm_head":        {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
             "bigram_embed":   {"optim": "adam",    "comms": "sharded_sparse", "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "post_lambdas":   {"optim": "adam",    "comms": "replicated",     "adam_betas": [0.9,  0.95], "lr_mul": 1.0,  "wd_mul": 0.0},
@@ -1696,7 +1724,7 @@ class TrainingManager():
         # - Process smaller/faster params first while large reduces complete
         # - lm_head must complete before embed sync (when tied)
         self.work_order = [
-            "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "post_lambdas", "x0_lambdas", "bigram_lambdas", "resid_lambdas",  # Small, fast
+            "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "late_attnres_queries", "late_attnres_bias", "post_lambdas", "x0_lambdas", "bigram_lambdas", "resid_lambdas",  # Small, fast
             "value_embeds", "bigram_embed",  # Medium
             "lm_head", "embed",   # lm_head must complete before embed sync (when tied)
             "attn_bank", "mlp_bank",  # Large, polar express - process last to maximize overlap
