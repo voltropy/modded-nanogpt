@@ -946,16 +946,19 @@ def norm(x: Tensor):
     return F.rms_norm(x, (x.size(-1),))
 
 
-def late_attention_residual_mix(x_backout: Tensor, x: Tensor, alpha: Tensor, gate_w: Tensor, gate_b: Tensor):
+def late_attention_residual_mix(x_backout: Tensor, x: Tensor, alpha: Tensor, gate_w: Tensor, gate_b: Tensor,
+                                use_alpha: bool, use_gate: bool):
     # Cheap late-layer evolution: a static per-layer leak plus a token-wise gate over the cached/current delta.
-    blend = torch.sigmoid(
-        alpha.type_as(x) +
-        F.linear(
+    blend = x.new_zeros((*x.shape[:-1], 1))
+    if use_alpha:
+        blend = blend + alpha.type_as(x)
+    if use_gate:
+        blend = blend + F.linear(
             x[..., :gate_w.size(-1)],
             gate_w[None].type_as(x),
             gate_b[None].type_as(x),
         )
-    )
+    blend = torch.sigmoid(blend)
     return x_backout + blend * (x - x_backout)
 
 
@@ -1161,11 +1164,16 @@ class ForwardScheduleConfig:
     train_max_seq_len: int
 
 class GPT(nn.Module):
-    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, head_dim: int, model_dim: int, max_seq_len: int):
+    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, head_dim: int, model_dim: int, max_seq_len: int,
+                 late_attnres_mode: str = "combined"):
         super().__init__()
         self.num_layers = num_layers
         self.vocab_size = next_multiple_of_n(vocab_size, n=128)
         self.late_attnres_start = num_layers - 3
+        assert late_attnres_mode in ("combined", "alpha_only", "gate_only"), f"invalid late_attnres_mode={late_attnres_mode}"
+        self.late_attnres_mode = late_attnres_mode
+        self.late_attnres_use_alpha = late_attnres_mode != "gate_only"
+        self.late_attnres_use_gate = late_attnres_mode != "alpha_only"
 
         self.smear_gate = nn.Linear(12, 1, bias=False)
         nn.init.zeros_(self.smear_gate.weight)
@@ -1363,6 +1371,8 @@ class GPT(nn.Module):
                         late_attnres_alpha[late_attnres_idx],
                         late_attnres_gate[late_attnres_idx],
                         late_attnres_gate_bias[late_attnres_idx],
+                        self.late_attnres_use_alpha,
+                        self.late_attnres_use_gate,
                     )
                 else:
                     attn_in = x
@@ -1591,6 +1601,8 @@ class Hyperparameters:
     run_evals: bool = False  # run additional evaluations after training is completed
     # bigram hash embedding
     bigram_vocab_size: int = 50304 * 5
+    # late attention residual routing ablation: combined|alpha_only|gate_only
+    late_attnres_mode: str = os.environ.get("LATE_ATTNRES_MODE", "combined")
 
 args = Hyperparameters()
 
@@ -1897,6 +1909,7 @@ print0("="*100)
 print0(f"Running Python {sys.version}")
 print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}")
 print0(f"Running Triton version {triton.__version__}")
+print0(f"late_attnres_mode: {args.late_attnres_mode}")
 
 def nvidia_smi():
     import subprocess  # avoid top level import
@@ -1910,7 +1923,8 @@ model: nn.Module = GPT(
     num_heads=6,
     head_dim=128,
     model_dim=768,
-    max_seq_len=args.val_batch_size // (grad_accum_steps * world_size)
+    max_seq_len=args.val_batch_size // (grad_accum_steps * world_size),
+    late_attnres_mode=args.late_attnres_mode,
 ).cuda()
 for m in model.modules():
     if isinstance(m, (nn.Embedding, nn.Linear)):
