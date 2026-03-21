@@ -1165,13 +1165,16 @@ class ForwardScheduleConfig:
 
 class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, num_heads: int, head_dim: int, model_dim: int, max_seq_len: int,
-                 late_attnres_mode: str = "combined"):
+                 late_attnres_mode: str = "combined", late_attnres_layers: int = 3):
         super().__init__()
         self.num_layers = num_layers
         self.vocab_size = next_multiple_of_n(vocab_size, n=128)
-        self.late_attnres_start = num_layers - 3
+        max_late_attnres_layers = num_layers - 8
+        assert 1 <= late_attnres_layers <= max_late_attnres_layers, f"invalid late_attnres_layers={late_attnres_layers}"
+        self.late_attnres_start = num_layers - late_attnres_layers
         assert late_attnres_mode in ("combined", "alpha_only", "gate_only"), f"invalid late_attnres_mode={late_attnres_mode}"
         self.late_attnres_mode = late_attnres_mode
+        self.late_attnres_layers = late_attnres_layers
         self.late_attnres_use_alpha = late_attnres_mode != "gate_only"
         self.late_attnres_use_gate = late_attnres_mode != "alpha_only"
 
@@ -1363,7 +1366,7 @@ class GPT(nn.Module):
             if i == 6:
                 x = x + skip_gate_out * skip_connection
             else:
-                if x_backout is not None:
+                if x_backout is not None and i >= self.late_attnres_start:
                     late_attnres_idx = i - self.late_attnres_start
                     attn_in = late_attention_residual_mix(
                         x_backout,
@@ -1374,6 +1377,8 @@ class GPT(nn.Module):
                         self.late_attnres_use_alpha,
                         self.late_attnres_use_gate,
                     )
+                elif x_backout is not None:
+                    attn_in = x_backout
                 else:
                     attn_in = x
                 attn_out = attn(norm(attn_in), attn_args, qkvo_w)
@@ -1592,10 +1597,10 @@ class Hyperparameters:
     # batch sizes
     val_batch_size: int = 4 * 64 * 1024 * 8
     # schedule
-    num_scheduled_iterations: int = 1450  # number of steps to complete lr and ws schedule
-    num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
+    num_scheduled_iterations: int = int(os.environ.get("NUM_SCHEDULED_ITERATIONS", 1450))  # number of steps to complete lr and ws schedule
+    num_extension_iterations: int = int(os.environ.get("NUM_EXTENSION_ITERATIONS", 40))  # number of steps to continue training at final lr and ws
     # evaluation and logging
-    run_id: str = f"{uuid.uuid4()}"
+    run_id: str = os.environ.get("RUN_ID", f"{uuid.uuid4()}")
     val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint: bool = False
     run_evals: bool = False  # run additional evaluations after training is completed
@@ -1603,6 +1608,7 @@ class Hyperparameters:
     bigram_vocab_size: int = 50304 * 5
     # late attention residual routing ablation: combined|alpha_only|gate_only
     late_attnres_mode: str = os.environ.get("LATE_ATTNRES_MODE", "combined")
+    late_attnres_layers: int = int(os.environ.get("LATE_ATTNRES_LAYERS", 3))
 
 args = Hyperparameters()
 
@@ -1910,6 +1916,8 @@ print0(f"Running Python {sys.version}")
 print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}")
 print0(f"Running Triton version {triton.__version__}")
 print0(f"late_attnres_mode: {args.late_attnres_mode}")
+print0(f"late_attnres_layers: {args.late_attnres_layers}")
+print0(f"num_extension_iterations: {args.num_extension_iterations}")
 
 def nvidia_smi():
     import subprocess  # avoid top level import
@@ -1925,6 +1933,7 @@ model: nn.Module = GPT(
     model_dim=768,
     max_seq_len=args.val_batch_size // (grad_accum_steps * world_size),
     late_attnres_mode=args.late_attnres_mode,
+    late_attnres_layers=args.late_attnres_layers,
 ).cuda()
 for m in model.modules():
     if isinstance(m, (nn.Embedding, nn.Linear)):
